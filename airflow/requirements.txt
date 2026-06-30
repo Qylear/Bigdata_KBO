@@ -1,0 +1,8 @@
+pyspark==3.5.1
+hdfs==2.7.3
+pymongo==4.8.0
+requests[socks]==2.32.3
+stem==1.8.2
+beautifulsoup4==4.12.3
+lxml==5.2.2
+playwright==1.45.0

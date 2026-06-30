@@ -1,0 +1,12 @@
+# Configuration Tor — proxy SOCKS5 + port de contrôle pour rotation NEWNYM
+SocksPort 0.0.0.0:9050
+ControlPort 0.0.0.0:9051
+
+# Le HashedControlPassword est injecté au démarrage par entrypoint.sh
+
+# Renouvellement de circuit plus réactif
+MaxCircuitDirtiness 60
+NewCircuitPeriod 30
+CircuitBuildTimeout 30
+
+Log notice stdout

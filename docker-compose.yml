@@ -1,0 +1,213 @@
+name: bigdata-stack
+
+# ---------------------------------------------------------------------------
+# Stack d'infrastructure (premier jet : tout doit démarrer + smoke tests)
+#   HDFS    : namenode + datanode  → stockage des PDF
+#   MongoDB : stockage des CSV
+#   Tor     : proxy SOCKS5 + contrôle NEWNYM (rotation d'IP)
+#   Postgres: base de métadonnées Airflow
+#   Airflow : orchestration (LocalExecutor) + PySpark en local[*]
+# ---------------------------------------------------------------------------
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  env_file:
+    - ./.env
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    PYTHONPATH: /opt/airflow/scripts
+    HDFS_URL: http://namenode:9870
+    HDFS_USER: root
+    KBO_DIR: /data/KBO
+    INGESTION_DB: kbo_db
+    MONGO_URI: mongodb://${MONGO_USER:-kbo}:${MONGO_PASSWORD:-kbo_secret}@mongo:27017/?authSource=admin
+    TOR_SOCKS: socks5h://haproxy:9050
+    NOTAIRE_TOR_SOCKS: socks5h://tor-notaire:9050
+    HDFS_DOCS_ROOT: /documents
+    # Scraping : notaire bloqué par F5 sur Tor → direct. kbopub/ejustice à tester.
+    NOTAIRE_USE_TOR: "false"
+    KBOPUB_USE_TOR: "true"
+    EJUSTICE_USE_TOR: "true"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - airflow_logs:/opt/airflow/logs
+    - ./KBO:/data/KBO:ro
+  depends_on: &airflow-deps
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ----------------------------- HDFS ----------------------------------- #
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    restart: unless-stopped
+    environment:
+      - CLUSTER_NAME=bigdata
+    env_file:
+      - ./hadoop.env
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    restart: unless-stopped
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+    env_file:
+      - ./hadoop.env
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+
+  # ----------------------------- MongoDB -------------------------------- #
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    restart: unless-stopped
+    # Plafonne le cache WiredTiger pour éviter que Mongo sature la RAM Docker
+    command: ["--wiredTigerCacheSizeGB", "1.5"]
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER:-kbo}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD:-kbo_secret}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ----------------------------- Tor pool ------------------------------ #
+  # Pool de N instances Tor : chacune a son propre circuit (IP de sortie),
+  # renouvelé périodiquement (MaxCircuitDirtiness). Plus d'IP simultanées =
+  # augmenter TOR_POOL_SIZE dans le .env.
+  tor:
+    build: ./tor
+    restart: unless-stopped
+    environment:
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:-tor_control_secret}
+    deploy:
+      replicas: ${TOR_POOL_SIZE:-6}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --max-time 25 --socks5-hostname localhost:9050 https://check.torproject.org/api/ip | grep -q IP"]
+      interval: 20s
+      timeout: 30s
+      retries: 15
+      start_period: 90s
+
+  # HAProxy : endpoint SOCKS unique (9050) réparti en round-robin sur le pool
+  haproxy:
+    image: haproxy:2.9-alpine
+    container_name: haproxy
+    restart: unless-stopped
+    depends_on:
+      - tor
+    ports:
+      - "9050:9050"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  # Tor dédié (IP stable) pour notaire.be : le challenge F5 lie ses
+  # cookies à l'IP de sortie → on ne peut pas passer par le pool round-robin.
+  tor-notaire:
+    build: ./tor
+    container_name: tor-notaire
+    restart: unless-stopped
+    environment:
+      - TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:-tor_control_secret}
+    # Circuit figé (IP de sortie stable) pour rester cohérent avec le cookie F5
+    command: ["MaxCircuitDirtiness", "86400", "NewCircuitPeriod", "86400"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s --max-time 25 --socks5-hostname localhost:9050 https://check.torproject.org/api/ip | grep -q IP"]
+      interval: 20s
+      timeout: 30s
+      retries: 15
+      start_period: 90s
+
+  # ----------------------------- Postgres (Airflow) --------------------- #
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------- Airflow -------------------------------- #
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-deps
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-deps
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  namenode_data:
+  datanode_data:
+  mongo_data:
+  postgres_data:
+  airflow_logs:
