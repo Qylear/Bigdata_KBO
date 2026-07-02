@@ -150,11 +150,27 @@ class Store:
         self.db = client[cfg["db"]]
         self.src = client[cfg["src_db"]]
         self.ejustice = self.db["ejustice"]
+        self.documents = self.db["documents"]
         self.checkpoints = self.db["documents_checkpoints"]
 
     def archive_html(self, numero, page, html):
         path = f"{self.cfg['hdfs_root']}/{_clean(numero)}/p{page}.html"
         self.hdfs.write(path, data=io.BytesIO(html.encode("utf-8")), overwrite=True)
+        return path
+
+    def put_publication_pdf(self, numero, pub, data):
+        """PDF d'une publication du Moniteur → HDFS + catalogue `documents`."""
+        num = _clean(numero)
+        numac = pub.get("numac")
+        path = f"{self.cfg['hdfs_root']}/{num}/pdf/{numac}.pdf"
+        self.hdfs.write(path, data=io.BytesIO(data), overwrite=True)
+        self.documents.replace_one(
+            {"_id": f"ejustice:{num}:{numac}"},
+            {"_id": f"ejustice:{num}:{numac}", "source": "ejustice", "type": "publication",
+             "enterprise": num, "numac": numac, "year": (pub.get("date") or "")[:4],
+             "title": pub.get("titre"), "filename": f"{numac}.pdf", "hdfs_path": path,
+             "date": pub.get("date"), "downloaded_at": _now()},
+            upsert=True)
         return path
 
     def save(self, numero, publications, pages):
@@ -208,42 +224,94 @@ def ingest_one(store, sess, numero) -> int:
 
 
 def run_ejustice(numeros=None) -> dict:
+    """Parallélisé (SCRAPE_WORKERS) + shardable (SHARD_INDEX/COUNT). Reprise via
+    checkpoint 'ejustice'. Chaque thread a sa propre session Tor + son Store."""
     logging.basicConfig(level=logging.INFO)
+    import threading
+
+    import parallel
     cfg = _cfg()
     store = Store(cfg)
-    sess = make_session(cfg)
-    log.info("eJustice : %s", "via Tor" if cfg["use_tor"] else "EN DIRECT")
+    workers = parallel.get_workers()
+    log.info("eJustice : %s (workers=%d)", "via Tor" if cfg["use_tor"] else "EN DIRECT", workers)
 
     explicit = numeros is not None  # liste fournie = on force le re-scraping
     if numeros is None:
-        numeros = iter_enterprise_numbers(store, cfg["only_active"], cfg["max_enterprises"])
+        numeros = [n for n in iter_enterprise_numbers(store, cfg["only_active"], cfg["max_enterprises"])
+                   if parallel.shard_ok(n)]
     else:
-        numeros = [_clean(n) for n in numeros]
+        numeros = [_clean(n) for n in numeros if parallel.shard_ok(_clean(n))]
 
-    seen = done = errs = skip = 0
-    for num in numeros:
-        seen += 1
-        if not explicit and store.is_done(num):
-            skip += 1
-            continue
+    c = {"seen": 0, "done": 0, "errs": 0, "skip": 0}
+    lock = threading.Lock()
+
+    def handle(ctx, num):
+        st, sess = ctx
+        if not explicit and st.is_done(num):
+            with lock:
+                c["seen"] += 1
+                c["skip"] += 1
+            return
         try:
-            n = ingest_one(store, sess, num)
-            store.mark(num, "done" if n >= 0 else "error")
-            done += (1 if n >= 0 else 0)
-            errs += (0 if n >= 0 else 1)
+            n = ingest_one(st, sess, num)
+            st.mark(num, "done" if n >= 0 else "error")
+            ok = n >= 0
         except Exception as exc:  # noqa: BLE001
-            store.mark(num, "error")
-            errs += 1
+            st.mark(num, "error")
+            ok = False
             log.warning("[%s] eJustice échec : %s", num, exc)
-        if seen % cfg["batch_size"] == 0:
-            log.info("… %d vues (ok=%d, déjà=%d, ko=%d)", seen, done, skip, errs)
-            if cfg["batch_pause"]:
-                time.sleep(cfg["batch_pause"])
+        with lock:
+            c["seen"] += 1
+            c["done"] += int(ok)
+            c["errs"] += int(not ok)
+            if c["seen"] % cfg["batch_size"] == 0:
+                log.info("… %d vues (ok=%d, déjà=%d, ko=%d)", c["seen"], c["done"], c["skip"], c["errs"])
         time.sleep(cfg["delay"])
 
-    summary = {"seen": seen, "scraped": done, "skipped": skip, "errors": errs}
+    parallel.run_pool(numeros, lambda: (Store(cfg), make_session(cfg)), handle, workers)
+    summary = {"seen": c["seen"], "scraped": c["done"], "skipped": c["skip"], "errors": c["errs"]}
     log.info("eJustice terminé : %s", summary)
     return summary
+
+
+def scrape_one(numero, force=False) -> list:
+    """eJustice À LA DEMANDE pour UNE entreprise : récupère les publications du
+    Moniteur, télécharge leurs PDF sur HDFS (+ catalogue `documents`) et renvoie
+    la liste. Mise en cache via checkpoint 'ejustice'."""
+    logging.basicConfig(level=logging.INFO)
+    cfg = _cfg()
+    store = Store(cfg)
+    num = _clean(numero)
+    if not force and store.is_done(num):
+        doc = store.ejustice.find_one({"_id": num})
+        return (doc or {}).get("publications", [])
+    sess = make_session(cfg)
+    html = fetch_list(sess, num, 1)
+    if html is None:
+        store.mark(num, "error")
+        return []
+    last = min(_last_page(html), MAX_PAGES)
+    all_pubs = parse_publications(html)
+    store.archive_html(num, 1, html)
+    for page in range(2, last + 1):
+        h = fetch_list(sess, num, page)
+        if not h:
+            break
+        store.archive_html(num, page, h)
+        all_pubs.extend(parse_publications(h))
+        time.sleep(cfg["delay"])
+    pubs = list({p["numac"]: p for p in all_pubs}.values())
+    for p in pubs:
+        try:
+            r = sess.get(p["pdf_url"], timeout=(20, 60))
+            if r.status_code == 200 and r.content[:4] == b"%PDF":
+                p["hdfs_path"] = store.put_publication_pdf(num, p, r.content)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] PDF eJustice %s abandonné : %s", num, p.get("numac"), exc)
+        time.sleep(cfg["delay"])
+    store.save(num, pubs, last)
+    store.mark(num, "done")
+    return pubs
 
 
 def verify() -> dict:

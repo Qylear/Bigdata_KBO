@@ -26,6 +26,7 @@ import logging
 
 import build_hotel_targets
 import ingestion_documents as m
+import kbopub
 
 
 def main(argv=None):
@@ -33,15 +34,19 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Scraping NBB — secteur hôtellerie")
     p.add_argument("--build", action="store_true", help="construire hotel_targets depuis enterprise_silver")
     p.add_argument("--scrape", action="store_true", help="scraper les dépôts NBB des cibles")
+    p.add_argument("--kbopub", action="store_true", help="scraper la fiche kbopub (dirigeants…) des cibles")
     args = p.parse_args(argv)
-    if not (args.build or args.scrape):
-        p.error("préciser au moins --build et/ou --scrape")
+    if not (args.build or args.scrape or args.kbopub):
+        p.error("préciser au moins --build, --scrape et/ou --kbopub")
 
     out = {}
     if args.build:
         out["targets"] = build_hotel_targets.build()
     if args.scrape:
         out["nbb"] = m.run_nbb_hotels()
+    if args.kbopub:
+        out["kbopub"] = kbopub.run_kbopub_hotels()
+    if args.scrape or args.kbopub:
         out["verify"] = m.verify()
     print(json.dumps(out, indent=2, default=str))
 
