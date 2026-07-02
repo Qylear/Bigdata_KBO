@@ -216,11 +216,18 @@ def ingest_nbb(store: Store, enterprise: str) -> dict:
     deposits = _http_get(sess, url).json().get("content", [])
     log.info("[%s] NBB : %d dépôts", enterprise, len(deposits))
 
-    pdf_ok = csv_ok = 0
+    pdf_ok = csv_ok = kept = 0
     for dep in deposits:
         dep_id, year, ref = dep["id"], dep.get("periodEndDateYear"), dep.get("reference")
-        if cfg.get("years") and _filing_year(dep) not in cfg["years"]:
+        if cfg.get("min_year"):
+            # Mode « depuis N » : on filtre sur l'ANNÉE D'EXERCICE
+            # (accountingYearEndDate ≈ periodEndDateYear), pas l'année de dépôt.
+            ey = str(year or "")
+            if not (ey.isdigit() and int(ey) >= cfg["min_year"]):
+                continue
+        elif cfg.get("years") and _filing_year(dep) not in cfg["years"]:
             continue
+        kept += 1
         try:
             r = _http_get(sess, f"{NBB_BASE}/external/broker/public/deposits/pdf/{dep_id}",
                           read_to=120)
@@ -241,14 +248,19 @@ def ingest_nbb(store: Store, enterprise: str) -> dict:
                     sess, f"{NBB_BASE}/external/broker/public/deposits/consult/csv/{dep_id}")
                 if r.status_code == 200 and r.text.strip():
                     codes = _nbb_parse_csv(r.text)
+                    # 1) parsé (codes PCMN) → Mongo comptes_annuels
                     store.put_nbb_csv(enterprise, year, ref, dep_id, codes, r.text)
+                    # 2) fichier CSV brut → HDFS (à côté du PDF) + catalogue documents
+                    store.put_pdf(enterprise, year, f"comptes_{ref}.csv", r.content,
+                                  source="nbb", doc_type="comptes_annuels_csv", url=r.url,
+                                  extra={"deposit_id": dep_id, "reference": ref})
                     csv_ok += 1
             except Exception as exc:  # noqa: BLE001
                 log.warning("[%s] CSV %s abandonné : %s", enterprise, year, exc)
             time.sleep(cfg["delay"])
 
     return {"enterprise": enterprise, "deposits": len(deposits),
-            "pdf": pdf_ok, "csv": csv_ok}
+            "filings": kept, "pdf": pdf_ok, "csv": csv_ok}
 
 
 def run_nbb() -> list[dict]:
@@ -511,6 +523,60 @@ def run_notaire_all() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# NBB ciblé HÔTELLERIE — piloté par la StateDB `hotel_targets`, dépôts >= 2021
+# --------------------------------------------------------------------------- #
+def iter_hotel_targets(store, limit=0):
+    """Numéros à scraper depuis hotel_targets (on saute ceux déjà 'done')."""
+    coll = store.db[os.getenv("HOTEL_STATE", "hotel_targets")]
+    cur = coll.find({"status": {"$ne": "done"}}, {"_id": 1}).batch_size(500)
+    n = 0
+    for doc in cur:
+        yield str(doc["_id"])
+        n += 1
+        if limit and n >= limit:
+            break
+
+
+def run_nbb_hotels() -> dict:
+    """Scrape les dépôts NBB des entreprises hôtelières (StateDB hotel_targets),
+    depuis DOC_MIN_YEAR (défaut 2021). Reprise : `status` done/error dans la
+    collection d'état. Lance d'abord build_hotel_targets.py pour peupler la liste."""
+    logging.basicConfig(level=logging.INFO)
+    cfg = _cfg()
+    cfg["years"] = None                                    # désactive le filtre par set d'années
+    cfg["min_year"] = int(os.getenv("DOC_MIN_YEAR", "2021"))  # on remonte jusqu'à 2021
+    store = Store(cfg)
+    state = store.db[os.getenv("HOTEL_STATE", "hotel_targets")]
+
+    total = state.count_documents({})
+    todo = state.count_documents({"status": {"$ne": "done"}})
+    log.info("Hôtellerie : %d cibles, %d à traiter (min_year=%d)",
+             total, todo, cfg["min_year"])
+
+    seen = done = errs = 0
+    for num in iter_hotel_targets(store, cfg["max_enterprises"]):
+        seen += 1
+        try:
+            res = ingest_nbb(store, num)
+            state.update_one({"_id": num},
+                             {"$set": {"status": "done", "scraped_at": _now(),
+                                       "filings_count": res.get("filings", 0), "result": res}})
+            done += 1
+        except Exception as exc:  # noqa: BLE001
+            state.update_one({"_id": num},
+                             {"$set": {"status": "error", "scraped_at": _now(), "error": str(exc)}})
+            errs += 1
+        if seen % 50 == 0:
+            log.info("… %d vues, %d ok, %d erreurs", seen, done, errs)
+        if cfg["batch_pause"] and seen % cfg["batch_size"] == 0:
+            time.sleep(cfg["batch_pause"])
+
+    summary = {"targets": total, "processed": done, "errors": errs}
+    log.info("NBB hôtellerie terminé : %s", summary)
+    return summary
+
+
+# --------------------------------------------------------------------------- #
 def verify() -> dict:
     store = Store(_cfg())
     counts = {
@@ -524,6 +590,7 @@ def verify() -> dict:
 
 
 if __name__ == "__main__":
+    # Test rapide sur les 3 entreprises du notebook (NBB + notaire).
     print(json.dumps(run_nbb(), indent=2))
     print(json.dumps(run_notaire(), indent=2))
     print(json.dumps(verify(), indent=2))
