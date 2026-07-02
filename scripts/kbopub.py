@@ -190,19 +190,35 @@ def parse_kbopub(html: str) -> dict:
     if link_ue:
         out["ue_url"] = link_ue.get("href")
 
-    # --- 2.4 Dirigeants ('Fonctions') : liens vers des personnes ---
-    # Heuristique : sous la section Fonctions, chaque ligne = fonction + nom + date
+    # --- 2.4 Dirigeants : on parse la SECTION 'Fonctions' en entier (tous
+    # libellés, publics compris : Bourgmestre, Secrétaire…). Les titres de
+    # section sont des cellules de classe 'I' ; une fonction = ligne à
+    # [fonction, nom, 'Depuis le …']. Les qualités/activités qui suivent sont
+    # en une seule cellule → écartées par le garde >= 2 cellules + nom valide.
+    current = None
     for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) >= 2:
-            fonction = _txt(tds[0])
-            nom = _txt(tds[1])
-            if fonction in ("Administrateur", "Administrateur délégué", "Gérant",
-                            "Gérant statutaire", "Représentant permanent",
-                            "Liquidateur", "Président", "Commissaire"):
-                out["fonctions"].append({
-                    "fonction": fonction, "nom": nom,
-                    "depuis": _txt(tds[2]) if len(tds) > 2 else None})
+        cells = tr.find_all(["td", "th"])
+        if not cells:
+            continue
+        fclass = cells[0].get("class") or []
+        if "I" in fclass:                      # en-tête de section
+            current = _txt(cells[0])
+            continue
+        if current in ("Fonctions", "Functies") and len(cells) >= 2:
+            fonction = _txt(cells[0])
+            nom = _txt(cells[1])
+            depuis = _txt(cells[2]) if len(cells) > 2 else None
+            if fonction and nom and not nom.startswith("Depuis") and "Depuis" not in fonction:
+                out["fonctions"].append({"fonction": fonction, "nom": nom, "depuis": depuis})
+        elif current in ("Liens entre entités", "Onderlinge betrekkingen"):
+            t = " ".join(_txt(c) for c in cells).strip()
+            if t and "Pas de données" not in t and "Geen gegevens" not in t:
+                mb = re.search(r"(\d{4}\.\d{3}\.\d{3})", t)
+                mn = re.search(r"\(([^)]+)\)", t)
+                out["liens_entites"].append({
+                    "bce": mb.group(1).replace(".", "") if mb else None,
+                    "nom": mn.group(1).strip() if mn else None,
+                    "texte": t})
 
     # --- 2.3 Activités (NACE TVA/ONSS) : liens naceToelichting ---
     for a in soup.find_all("a", href=re.compile(r"naceToelichting")):
@@ -217,12 +233,6 @@ def parse_kbopub(html: str) -> dict:
             "nace_code": mcode.group(1) if mcode else _txt(a),
             "ligne": ligne,
         })
-
-    # --- 2.5 Liens entre entités ---
-    # (souvent "Pas de données" ; on capture le texte de la section si présent)
-    liens = g("Liens entre entités")
-    if liens and "Pas de données" not in liens:
-        out["liens_entites"].append(liens)
 
     # --- Liens externes (ejustice / NBB / notaire) ---
     for a in soup.find_all("a", href=True):
@@ -302,41 +312,89 @@ def ingest_one(store, sess, numero) -> bool:
 
 
 def run_kbopub(numeros=None) -> dict:
+    """Parallélisé (SCRAPE_WORKERS) + shardable (SHARD_INDEX/COUNT). Reprise via
+    checkpoint 'kbopub'. Chaque thread a sa propre session Tor + son propre Store."""
+    logging.basicConfig(level=logging.INFO)
+    import threading
+
+    import parallel
+    cfg = _cfg()
+    store = Store(cfg)
+    workers = parallel.get_workers()
+    log.info("kbopub : %s (workers=%d)", "via Tor" if cfg["use_tor"] else "EN DIRECT", workers)
+
+    if numeros is None:
+        numeros = [n for n in iter_enterprise_numbers(store, cfg["only_active"], cfg["max_enterprises"])
+                   if parallel.shard_ok(n)]
+    else:
+        numeros = [_clean(n) for n in numeros if parallel.shard_ok(_clean(n))]
+
+    c = {"seen": 0, "done": 0, "errs": 0, "skip": 0}
+    lock = threading.Lock()
+
+    def handle(ctx, num):
+        st, sess = ctx
+        if st.is_done(num):
+            with lock:
+                c["seen"] += 1
+                c["skip"] += 1
+            return
+        try:
+            ok = bool(ingest_one(st, sess, num))
+            st.mark(num, "done" if ok else "empty")
+        except Exception as exc:  # noqa: BLE001
+            st.mark(num, "error")
+            ok = False
+            log.warning("[%s] kbopub échec : %s", num, exc)
+        with lock:
+            c["seen"] += 1
+            c["done"] += int(ok)
+            c["errs"] += int(not ok)
+            if c["seen"] % cfg["batch_size"] == 0:
+                log.info("… %d vues (ok=%d, déjà=%d, ko=%d)", c["seen"], c["done"], c["skip"], c["errs"])
+        time.sleep(cfg["delay"])
+
+    parallel.run_pool(numeros, lambda: (Store(cfg), make_session(cfg)), handle, workers)
+    summary = {"seen": c["seen"], "scraped": c["done"], "skipped": c["skip"], "errors": c["errs"]}
+    log.info("kbopub terminé : %s", summary)
+    return summary
+
+
+def run_kbopub_hotels(limit=0) -> dict:
+    """kbopub ciblé sur les entreprises de hotel_targets (dirigeants, contacts,
+    capital…). Reprise via checkpoint 'kbopub' (les déjà 'done' sont sautées)."""
     logging.basicConfig(level=logging.INFO)
     cfg = _cfg()
     store = Store(cfg)
+    state = store.db[os.getenv("HOTEL_STATE", "hotel_targets")]
+    nums = [str(d["_id"]) for d in state.find({}, {"_id": 1})]
+    limit = limit or cfg["max_enterprises"]
+    if limit:
+        nums = nums[:limit]
+    log.info("kbopub hôtellerie : %d cibles", len(nums))
+    return run_kbopub(nums)
+
+
+def scrape_one(numero, force=False) -> list:
+    """Scrape À LA DEMANDE la fiche kbopub d'UNE entreprise → dirigeants.
+    Met en cache (checkpoint 'kbopub') : si déjà fait et pas force, on relit
+    simplement la base. Renvoie la liste `fonctions` (dirigeants/représentants)."""
+    logging.basicConfig(level=logging.INFO)
+    cfg = _cfg()
+    store = Store(cfg)
+    num = _clean(numero)
+    if not force and store.is_done(num):
+        doc = store.kbopub.find_one({"_id": num})
+        return (doc or {}).get("fonctions", [])
     sess = make_session(cfg)
-    log.info("kbopub : %s", "via Tor" if cfg["use_tor"] else "EN DIRECT")
-
-    if numeros is None:
-        numeros = iter_enterprise_numbers(store, cfg["only_active"], cfg["max_enterprises"])
-    else:
-        numeros = [_clean(n) for n in numeros]
-
-    seen = done = errs = skip = 0
-    for num in numeros:
-        seen += 1
-        if store.is_done(num):
-            skip += 1
-            continue
-        try:
-            ok = ingest_one(store, sess, num)
-            store.mark(num, "done" if ok else "empty")
-            done += ok
-            errs += (0 if ok else 1)
-        except Exception as exc:  # noqa: BLE001
-            store.mark(num, "error")
-            errs += 1
-            log.warning("[%s] kbopub échec : %s", num, exc)
-        if seen % cfg["batch_size"] == 0:
-            log.info("… %d vues (ok=%d, déjà=%d, ko=%d)", seen, done, skip, errs)
-            if cfg["batch_pause"]:
-                time.sleep(cfg["batch_pause"])
-        time.sleep(cfg["delay"])
-
-    summary = {"seen": seen, "scraped": done, "skipped": skip, "errors": errs}
-    log.info("kbopub terminé : %s", summary)
-    return summary
+    try:
+        ok = bool(ingest_one(store, sess, num))
+        store.mark(num, "done" if ok else "empty")
+    except Exception as exc:  # noqa: BLE001
+        store.mark(num, "error")
+        log.warning("[%s] kbopub on-demand échec : %s", num, exc)
+    doc = store.kbopub.find_one({"_id": num})
+    return (doc or {}).get("fonctions", [])
 
 
 def verify() -> dict:

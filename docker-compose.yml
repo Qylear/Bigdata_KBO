@@ -205,6 +205,34 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # ----------------------------- API + Frontend ------------------------- #
+  # FastAPI expose hotel_gold / enterprise_silver + SSE notaire ; sert aussi
+  # le frontend statique (Part 3). UI : http://localhost:8000
+  api:
+    build: ./api
+    container_name: api
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://${MONGO_USER:-kbo}:${MONGO_PASSWORD:-kbo_secret}@mongo:27017/?authSource=admin
+      INGESTION_DB: kbo_db
+      # Réutilise les scrapers (kbopub/notaire) montés depuis scripts/
+      PYTHONPATH: /app/scripts
+      HDFS_URL: http://namenode:9870
+      HDFS_USER: root
+      TOR_SOCKS: socks5h://haproxy:9050
+      NOTAIRE_TOR_SOCKS: socks5h://tor-notaire:9050
+      NOTAIRE_USE_TOR: "false"
+      KBOPUB_USE_TOR: "true"
+      HDFS_DOCS_ROOT: /documents
+    volumes:
+      - ./scripts:/app/scripts
+      - ./api/static:/app/static
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
 volumes:
   namenode_data:
   datanode_data:
